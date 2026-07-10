@@ -36,6 +36,7 @@
   let totalCompletionTokens = 0;
   let totalInEstimate = 0;
   let totalOutEstimate = 0;
+  let activeAbortController = null;
 
   // ====== 本地存储 Key（严格分离：历史 vs 自定义模板） ======
   const LS_MODEL = "cfw_model";
@@ -279,11 +280,65 @@
     if (stick) scrollToBottom();
   });
 
+  window.addEventListener("pagehide", () => {
+    if (activeAbortController) activeAbortController.abort();
+  });
+
+  function findSseEventEnd(buffer){
+    const rn = buffer.indexOf("\r\n\r\n");
+    const nn = buffer.indexOf("\n\n");
+
+    if (rn === -1) {
+      if (nn === -1) return null;
+      return { index: nn, length: 2 };
+    }
+
+    if (nn === -1 || rn < nn) {
+      return { index: rn, length: 4 };
+    }
+
+    return { index: nn, length: 2 };
+  }
+
+  function parseSseEvent(rawEvent){
+    const event = {
+      data: "",
+      id: "",
+      event: ""
+    };
+    const dataLines = [];
+    const lines = rawEvent.split(/\r\n|\n|\r/);
+
+    for (const line of lines) {
+      if (!line || line.startsWith(":")) continue;
+
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+
+      if (value.startsWith(" ")) value = value.slice(1);
+
+      if (field === "data") {
+        dataLines.push(value);
+      } else if (field === "id") {
+        event.id = value;
+      } else if (field === "event") {
+        event.event = value;
+      }
+    }
+
+    event.data = dataLines.join("\n");
+    return event;
+  }
 
   async function send(){
     updateSpacer();
     const text = inputEl.value.trim();
     if (!text) return;
+
+    if (activeAbortController) activeAbortController.abort();
+    const abortController = new AbortController();
+    activeAbortController = abortController;
 
     const userRow = makeRow("user");
     userRow.bubble.textContent = text;
@@ -305,59 +360,130 @@
     let outEndMs = 0;
     let full = "";
     let exactUsage = null;
+    let renderPending = false;
+
+    const flushBubble = () => {
+      renderPending = false;
+      aiRow.bubble.textContent = full;
+      if (isNearBottom()) scrollToBottom();
+    };
+
+    const scheduleBubbleUpdate = () => {
+      if (renderPending) return;
+      renderPending = true;
+
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(flushBubble);
+      } else {
+        setTimeout(flushBubble, 30);
+      }
+    };
+
+    const processSseEvent = (event) => {
+      const jsonStr = event.data.trim();
+      if (!jsonStr || jsonStr === "[DONE]") return;
+
+      try {
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.usage) exactUsage = parsed.usage;
+
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) {
+          if (!outStartMs) outStartMs = performance.now();
+          full += delta;
+          scheduleBubbleUpdate();
+        }
+      } catch {}
+    };
 
     let customPrompt = "";
     if (!useBuiltin) {
       if (promptEnabled) customPrompt = localStorage.getItem(LS_CUSTOM_PROMPT) || "";
     }
 
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: modelSel.value,
-        use_builtin_persona: useBuiltin,
-        custom_system_prompt: customPrompt,
-        messages: session
-      })
-    });
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
+        body: JSON.stringify({
+          model: modelSel.value,
+          use_builtin_persona: useBuiltin,
+          custom_system_prompt: customPrompt,
+          messages: session
+        })
+      });
 
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      aiRow.bubble.textContent = `Request failed (${res.status}):\n${t}`;
-      aiRow.stats.textContent = "";
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        aiRow.bubble.textContent = `Request failed (${res.status}):\n${t}`;
+        aiRow.stats.textContent = "";
+        return;
+      }
+
+      if (!res.body) {
+        aiRow.bubble.textContent = "Request failed: response body is empty.";
+        aiRow.stats.textContent = "";
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        while (true) {
+          const end = findSseEventEnd(buffer);
+          if (!end) break;
+
+          const rawEvent = buffer.slice(0, end.index);
+          buffer = buffer.slice(end.index + end.length);
+
+          const event = parseSseEvent(rawEvent);
+          processSseEvent(event);
+        }
+      }
+
+      buffer += decoder.decode();
+
+      while (true) {
+        const end = findSseEventEnd(buffer);
+        if (!end) break;
+
+        const rawEvent = buffer.slice(0, end.index);
+        buffer = buffer.slice(end.index + end.length);
+
+        const event = parseSseEvent(rawEvent);
+        processSseEvent(event);
+      }
+
+      if (buffer.trim()) {
+        const event = parseSseEvent(buffer);
+        processSseEvent(event);
+      }
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        if (!full) aiRow.bubble.textContent = "Request aborted.";
+      } else {
+        aiRow.bubble.textContent = `Network error:\n${err?.message || String(err)}`;
+        aiRow.stats.textContent = "";
+      }
       return;
+    } finally {
+      if (activeAbortController === abortController) {
+        activeAbortController = null;
+      }
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split("\n");
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-
-        const jsonStr = line.replace("data: ", "").trim();
-        if (!jsonStr || jsonStr === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(jsonStr);
-          if (parsed.usage) exactUsage = parsed.usage;
-
-          const delta = parsed.choices?.[0]?.delta?.content;
-          if (delta) {
-            if (!outStartMs) outStartMs = performance.now();
-            full += delta;
-            aiRow.bubble.textContent = full;
-            if (isNearBottom()) scrollToBottom();
-          }
-        } catch {}
-      }
+    if (renderPending) {
+      flushBubble();
+    } else {
+      aiRow.bubble.textContent = full;
     }
 
     outEndMs = performance.now();
